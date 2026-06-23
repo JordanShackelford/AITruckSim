@@ -1,0 +1,16 @@
+{
+  "name": "truck-rl",
+  "version": "0.1.0",
+  "description": "Articulated-truck driving sim trained with deep RL (PPO) over a vectorized-scene observation, with an optional cross-attention scene encoder and a WebGPU browser training port.",
+  "license": "MIT",
+  "scripts": {
+    "gradcheck": "node gradcheck.js",
+    "gradcheck:attn": "node gradcheck_attn.js",
+    "toy": "node toy.js",
+    "train": "node trucktrain.js",
+    "train:drive": "NOBS=0 node trucktrain.js",
+    "train:dodge": "NOBS=2 node trucktrain.js",
+    "ab": "node trucktrain_attn.js"
+  },
+  "keywords": ["reinforcement-learning", "ppo", "self-driving", "attention", "webgpu"]
+}

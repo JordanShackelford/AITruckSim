@@ -1,0 +1,557 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Truck-RL · WebGPU PPO</title>
+<!-- tfjs core + WebGPU backend (loaded at runtime in YOUR browser; cannot be fetched in the build sandbox) -->
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-core@4.22.0/dist/tf-core.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-backend-cpu@4.22.0/dist/tf-backend-cpu.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-backend-webgl@4.22.0/dist/tf-backend-webgl.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-backend-webgpu@4.22.0/dist/tf-backend-webgpu.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-layers@4.22.0/dist/tf-layers.min.js"></script>
+<style>
+  :root{--bg:#0d1014;--pn:#151a21;--ln:#222c38;--fg:#cdd6e0;--mut:#7d8b9c;--acc:#ffd23f;--ok:#52d273;--bad:#e8584f;--blu:#6ca8ff}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);font:13px/1.5 ui-monospace,Menlo,Consolas,monospace}
+  header{padding:10px 16px;border-bottom:1px solid var(--ln);display:flex;gap:16px;align-items:center;flex-wrap:wrap}
+  h1{font-size:15px;margin:0;color:var(--acc);font-weight:700}
+  .wrap{display:grid;grid-template-columns:1fr 320px;gap:0;height:calc(100vh - 52px)}
+  #stage{position:relative;width:100%;height:100%}
+  #view,#view3d{position:absolute;inset:0;width:100%;height:100%}
+  #view{display:block;background:#0a0d11}
+  #view3d{display:none}
+  #hud3d{position:absolute;inset:0;width:100%;height:100%;display:none;pointer-events:none}
+  #view3d canvas{width:100%!important;height:100%!important;display:block}
+  aside{border-left:1px solid var(--ln);padding:14px;overflow:auto;background:var(--pn)}
+  button{background:#1d2632;color:var(--fg);border:1px solid var(--ln);border-radius:7px;padding:7px 12px;cursor:pointer;font:inherit}
+  button.primary{background:var(--acc);color:#1a1a1a;border-color:var(--acc);font-weight:700}
+  button:disabled{opacity:.5;cursor:default}
+  select,input[type=range]{background:#1d2632;color:var(--fg);border:1px solid var(--ln);border-radius:6px;padding:4px}
+  .row{display:flex;gap:8px;align-items:center;margin:8px 0;flex-wrap:wrap}
+  .stat{display:flex;justify-content:space-between;padding:3px 0;border-bottom:1px solid #1a222c}
+  .stat{border-bottom:1px solid #1a222c}
+  .stat b{color:var(--fg);font-weight:600}
+  .k{color:var(--mut)}
+  #chart{width:100%;height:90px;background:#0a0d11;border:1px solid var(--ln);border-radius:6px;margin-top:8px}
+  .pill{padding:2px 8px;border-radius:999px;border:1px solid var(--ln);color:var(--mut);font-size:11px}
+  .good{color:var(--ok);border-color:#244} .bad{color:var(--bad);border-color:#522}
+  .note{color:var(--mut);font-size:11px;margin-top:10px;border-top:1px solid var(--ln);padding-top:8px}
+</style>
+</head>
+<body>
+<header>
+  <h1>Truck-RL · WebGPU PPO</h1>
+  <span id="backend" class="pill">backend: …</span>
+  <span id="status" class="pill">idle</span>
+</header>
+<div class="wrap">
+  <div id="stage">
+    <canvas id="view"></canvas>
+    <div id="view3d"></div>
+    <canvas id="hud3d"></canvas>
+  </div>
+  <aside>
+    <div class="row">
+      <label class="k">task</label>
+      <select id="task">
+        <option value="toy">Toy point-mass (self-test)</option>
+        <option value="truck" selected>Truck driving</option>
+      </select>
+    </div>
+    <div class="row">
+      <label class="k">view</label>
+      <select id="viewmode">
+        <option value="chase" selected>2D chase cam</option>
+        <option value="topdown">2D top-down</option>
+        <option value="chase3d">3D chase</option>
+        <option value="cab3d">3D in-cab</option>
+      </select>
+    </div>
+    <div class="row" id="obsRow">
+      <label class="k">obstacles</label>
+      <input id="nobs" type="range" min="0" max="6" value="2" step="1"/>
+      <span id="nobsv">2</span>
+    </div>
+    <div class="row">
+      <button id="start" class="primary">Start</button>
+      <button id="stop" disabled>Stop</button>
+      <button id="reset">Reset agent</button>
+    </div>
+    <div id="stats"></div>
+    <canvas id="chart"></canvas>
+    <div class="note">
+      <b>Verification ladder.</b> Run the toy task first — return should climb from negative toward ~50
+      (proves the in-browser PPO learns, same as the node reference). Then the truck: watch <b>goal%</b>
+      climb and the rig drive/dodge. The PPO math here mirrors the gradient-checked node implementation;
+      tfjs supplies autodiff + WebGPU compute.
+    </div>
+  </aside>
+</div>
+<script>
+/* ============================================================================
+   Truck-RL WebGPU PPO — browser port.
+   env + rollout + GAE are the SAME logic as the verified node reference;
+   only the network forward + gradient update run through tfjs (autodiff + WebGPU).
+   ============================================================================ */
+const $ = id => document.getElementById(id);
+const LOG2PI = Math.log(2*Math.PI);
+
+/* ---------- deterministic RNG (so runs are reproducible) ---------- */
+function mkrng(s){ s|=0; return ()=>{ s=(s*1103515245+12345)&0x7fffffff; return s/0x7fffffff; }; }
+function gauss(rng){ let u=0,v=0; while(!u)u=rng(); while(!v)v=rng(); return Math.sqrt(-2*Math.log(u))*Math.cos(2*Math.PI*v); }
+
+/* ======================= ENVIRONMENTS (ported, pure JS) ======================= */
+const L1=38, L2=78, MAX_STEER=0.55, JACKKNIFE=1.61;
+const LANE_HW=70, V_MAX=2.2, RANGE=320, K=5;
+function normA(a){ while(a>Math.PI)a-=2*Math.PI; while(a<-Math.PI)a+=2*Math.PI; return a; }
+
+class TruckEnv {
+  constructor(rng,opts={}){ this.rng=rng; this.goalX=opts.goalX||1100; this.nObs=opts.nObs??0; this.maxT=opts.maxT||700;
+    this.OBS_DIM=6+K*5; this.ACT_DIM=2; }
+  reset(){ this.x=120; this.y=(this.rng()*2-1)*15; this.h1=0; this.h2=0; this.v=1.0; this.t=0; this.trail=[]; this.prevDist=this._gd();
+    this.obs=[]; for(let i=0;i<this.nObs;i++){ const ox=360+this.rng()*(this.goalX-480), oy=(this.rng()*2-1)*(LANE_HW-18),
+      ovy=(this.rng()<0.4)?(this.rng()*2-1)*0.5:0; this.obs.push({x:ox,y:oy,vx:0,vy:ovy}); } return this._o(); }
+  _gd(){ return Math.hypot(this.goalX-this.x, 0-this.y); }
+  _o(){ const o=new Float32Array(this.OBS_DIM);
+    const ga=Math.atan2(0-this.y,this.goalX-this.x), hErr=normA(ga-this.h1);
+    o[0]=Math.max(-1,Math.min(1,this.v/V_MAX)); o[1]=normA(this.h1-this.h2)/JACKKNIFE;
+    o[2]=Math.sin(hErr); o[3]=Math.cos(hErr); o[4]=Math.max(-1.5,Math.min(1.5,this.y/LANE_HW));
+    o[5]=Math.max(0,Math.min(1,(this.goalX-this.x)/this.goalX));
+    const c=Math.cos(-this.h1), s=Math.sin(-this.h1), rel=[];
+    for(const ob of this.obs){ const dx=ob.x-this.x,dy=ob.y-this.y, ex=dx*c-dy*s, ey=dx*s+dy*c, d=Math.hypot(ex,ey);
+      if(d<RANGE*1.4) rel.push({ex,ey,evx:ob.vx*c-ob.vy*s,evy:ob.vx*s+ob.vy*c,d}); }
+    rel.sort((a,b)=>a.d-b.d);
+    for(let i=0;i<K;i++){ const b=6+i*5; if(i<rel.length){ const r=rel[i];
+      o[b]=Math.max(-1,Math.min(1,r.ex/RANGE)); o[b+1]=Math.max(-1,Math.min(1,r.ey/RANGE));
+      o[b+2]=Math.max(-1,Math.min(1,r.evx)); o[b+3]=Math.max(-1,Math.min(1,r.evy)); o[b+4]=1; } }
+    return o; }
+  step(a){ const steer=Math.max(-1,Math.min(1,a[0]))*MAX_STEER, thr=Math.max(-1,Math.min(1,a[1])); this._steer=steer; this._thr=thr;
+    this.v=Math.max(-0.4,Math.min(V_MAX,this.v+thr*0.08));
+    this.x+=this.v*Math.cos(this.h1); this.y+=this.v*Math.sin(this.h1);
+    if(this.trail){ this.trail.push(this.x); this.trail.push(this.y); if(this.trail.length>240) this.trail.splice(0,2); }
+    this.h1=normA(this.h1+(this.v/L1)*Math.tan(steer)); this.h2=normA(this.h2+(this.v/L2)*Math.sin(normA(this.h1-this.h2)));
+    for(const ob of this.obs){ ob.y+=ob.vy; if(Math.abs(ob.y)>LANE_HW-10)ob.vy*=-1; }
+    this.t++; const dist=this._gd();
+    let r=(this.prevDist-dist)*0.03 - Math.abs(this.y)/LANE_HW*0.003 - 0.003; this.prevDist=dist;
+    let nd=1e9; for(const ob of this.obs){ const d=Math.hypot(ob.x-this.x,ob.y-this.y); if(d<nd)nd=d; }
+    if(nd<75) r-=(75-nd)/75*0.03;
+    let done=false, end='';
+    for(const ob of this.obs){ if(Math.hypot(ob.x-this.x,ob.y-this.y)<34){ r-=8; done=true; end='crash'; break; } }
+    if(!done){ if(Math.abs(normA(this.h1-this.h2))>JACKKNIFE){r-=8;done=true;end='jackknife';}
+      else if(Math.abs(this.y)>LANE_HW+14){r-=6;done=true;end='offlane';}
+      else if(this.x>=this.goalX){r+=12;done=true;end='goal';}
+      else if(this.t>=this.maxT){done=true;end='timeout';} }
+    return {obs:this._o(), reward:r, done, end}; }
+  getView(){ if(this.x===undefined)this.reset();
+    const trcx=this.x-(L2/2)*Math.cos(this.h2), trcy=this.y-(L2/2)*Math.sin(this.h2);
+    return { kind:'truck',
+      road:{goalX:this.goalX, halfWidth:LANE_HW, length:this.goalX+200},
+      tractor:{x:this.x, y:this.y, h:this.h1, len:38, wid:24},
+      trailer:{x:trcx, y:trcy, h:this.h2, len:92, wid:26},
+      steer:this._steer||0, throttle:this._thr||0, v:this.v, hitch:normA(this.h1-this.h2),
+      obstacles:this.obs.map(o=>({x:o.x,y:o.y,vx:o.vx,vy:o.vy,r:17})),
+      trail:this.trail||[], distToGoal:Math.max(0,this.goalX-this.x) };
+  }
+}
+class ToyEnv {
+  constructor(rng){ this.rng=rng; this.OBS_DIM=6; this.ACT_DIM=2; }
+  reset(){ this.px=0;this.py=0;this.vx=0;this.vy=0;this.gx=(this.rng()*2-1)*0.8;this.gy=(this.rng()*2-1)*0.8;this.t=0; return this._o(); }
+  _o(){ return new Float32Array([this.px,this.py,this.vx,this.vy,this.gx-this.px,this.gy-this.py]); }
+  step(a){ const ax=Math.max(-1,Math.min(1,a[0])),ay=Math.max(-1,Math.min(1,a[1]));
+    this.vx=(this.vx+ax*0.06)*0.92; this.vy=(this.vy+ay*0.06)*0.92; this.px+=this.vx; this.py+=this.vy; this.t++;
+    const d=Math.hypot(this.gx-this.px,this.gy-this.py); let r=-d*0.05; const reached=d<0.08; if(reached)r+=1;
+    const done=this.t>=60; return {obs:this._o(),reward:r,done,end:reached?'goal':'timeout'}; }
+  getView(){ if(this.px===undefined)this.reset(); return { kind:'toy', px:this.px, py:this.py, gx:this.gx, gy:this.gy }; }
+}
+
+/* ======================= PPO (tfjs: autodiff + WebGPU) ======================= */
+class PPO {
+  constructor(obsDim, actDim, cfg={}){
+    this.obsDim=obsDim; this.actDim=actDim;
+    this.gamma=cfg.gamma??0.99; this.lam=cfg.lam??0.95; this.clip=cfg.clip??0.2;
+    this.entCoef0=cfg.entCoef??0.005; this.entCoef=this.entCoef0; this.vfCoef=cfg.vfCoef??0.5;
+    this.lr0=cfg.lr??3e-4; this.epochs=cfg.epochs??8; this.mb=cfg.mb??256; this.targetKL=cfg.targetKL??0.04;
+    const mk=(out,outAct)=>{ const m=tf.sequential();
+      m.add(tf.layers.dense({units:64,inputShape:[obsDim],activation:'tanh',kernelInitializer:'glorotUniform'}));
+      m.add(tf.layers.dense({units:64,activation:'tanh',kernelInitializer:'glorotUniform'}));
+      m.add(tf.layers.dense({units:out,activation:outAct,kernelInitializer:tf.initializers.varianceScaling({scale:0.01})}));
+      return m; };
+    this.pi=mk(actDim,'linear'); this.vf=mk(1,'linear');
+    this.logStd=tf.variable(tf.fill([actDim], Math.log(cfg.initStd??0.7)), true, 'logStd');
+    this.opt=tf.train.adam(this.lr0);
+  }
+  setLR(lr){ this.lr0=lr; this.opt=tf.train.adam(lr); }
+  /* batched forward for B observations -> {means:[B][act], values:[B]} (sync readback once per step, amortized over B envs) */
+  forwardBatch(obs2d){ return tf.tidy(()=>{
+    const o=tf.tensor2d(obs2d);
+    const mean=this.pi.predict(o); const val=this.vf.predict(o).reshape([obs2d.length]);
+    return {mean:mean.arraySync(), value:val.arraySync()};
+  }); }
+  /* GAE per stream (same as verified node version) */
+  gae(rew,val,done,lastVal){ const T=rew.length, adv=new Float32Array(T), ret=new Float32Array(T); let g=0;
+    for(let t=T-1;t>=0;t--){ const nv=t===T-1?lastVal:val[t+1], nt=1-done[t];
+      const delta=rew[t]+this.gamma*nv*nt-val[t]; g=delta+this.gamma*this.lam*nt*g; adv[t]=g; ret[t]=g+val[t]; }
+    return {adv,ret}; }
+  /* PPO update on a flat batch; mirrors the verified loss expression exactly */
+  async update(obs,act,oldlp,adv,ret){
+    const N=obs.length;
+    let m=0; for(let i=0;i<N;i++)m+=adv[i]; m/=N; let v=0; for(let i=0;i<N;i++)v+=(adv[i]-m)**2; v/=N; const sd=Math.sqrt(v)+1e-8;
+    const advN=new Float32Array(N); for(let i=0;i<N;i++)advN[i]=(adv[i]-m)/sd;
+    const obsT=tf.tensor2d(obs), actT=tf.tensor2d(act), oldT=tf.tensor1d(oldlp), advT=tf.tensor1d(advN), retT=tf.tensor1d(ret);
+    const idx=Array.from({length:N},(_,i)=>i); let lastInfo={};
+    for(let ep=0; ep<this.epochs; ep++){
+      for(let i=N-1;i>0;i--){ const j=(Math.random()*(i+1))|0; [idx[i],idx[j]]=[idx[j],idx[i]]; }
+      let epKL=0, nb=0;
+      for(let s=0;s<N;s+=this.mb){
+        const end=Math.min(s+this.mb,N); const sel=tf.tensor1d(idx.slice(s,end),'int32');
+        const oB=obsT.gather(sel), aB=actT.gather(sel), oldB=oldT.gather(sel), advB=advT.gather(sel), retB=retT.gather(sel);
+        this.opt.minimize(()=>{
+          const mean=this.pi.predict(oB);                                   // [mb, act]
+          const std=tf.exp(this.logStd);                                    // [act]
+          const z=tf.div(tf.sub(aB,mean),std);
+          const logp=tf.sum(tf.sub(tf.sub(tf.mul(-0.5,tf.square(z)), this.logStd), 0.5*LOG2PI), 1); // [mb]
+          const ratio=tf.exp(tf.sub(logp,oldB));
+          const surr1=tf.mul(ratio,advB);
+          const surr2=tf.mul(tf.clipByValue(ratio,1-this.clip,1+this.clip),advB);
+          const piLoss=tf.neg(tf.mean(tf.minimum(surr1,surr2)));
+          const val=this.vf.predict(oB).reshape([end-s]);
+          const vLoss=tf.mul(0.5*this.vfCoef, tf.mean(tf.square(tf.sub(val,retB))));
+          const ent=tf.sum(this.logStd);                                     // entropy ∝ sum(logStd)+const
+          return tf.add(tf.sub(piLoss, tf.mul(this.entCoef,ent)), vLoss);
+        }, false);
+        // approx KL of the step just taken (separate eval, OUTSIDE the gradient tape) -> early-stop signal
+        const klVal=tf.tidy(()=>{
+          const mean=this.pi.predict(oB), std=tf.exp(this.logStd);
+          const z=tf.div(tf.sub(aB,mean),std);
+          const logp=tf.sum(tf.sub(tf.sub(tf.mul(-0.5,tf.square(z)), this.logStd), 0.5*LOG2PI), 1);
+          return tf.mean(tf.sub(oldB,logp)).arraySync();
+        });
+        epKL+=klVal; nb++;
+        tf.dispose([oB,aB,oldB,advB,retB,sel]);
+        lastInfo={kl:klVal, std:Math.exp(this.logStd.arraySync()[0])};
+        await tf.nextFrame();   // yield so the UI stays alive
+      }
+      if(nb && (epKL/nb) > 1.5*this.targetKL) break;   // KL early-stop
+    }
+    tf.dispose([obsT,actT,oldT,advT,retT]);
+    return lastInfo;
+  }
+  resetAdamNoise(){ /* placeholder for SAC/Dreamer swap */ }
+  dispose(){ this.pi.dispose(); this.vf.dispose(); this.logStd.dispose(); }
+}
+
+/* ======================= training loop + UI ======================= */
+let running=false, agent=null, hist=[], iter=0, rng;
+const B=16, T=128;   // 16 parallel envs × 128 steps = 2048 samples / update
+
+function mkEnvs(){ const task=$('task').value, n=+$('nobs').value;
+  const a=[]; for(let i=0;i<B;i++){ const r=mkrng((iter*7919+i*104729+1)>>>0);
+    a.push(task==='toy'?new ToyEnv(r):new TruckEnv(r,{nObs:n,goalX:1100,maxT:700})); } return a; }
+
+async function rolloutAndUpdate(){
+  const envs=mkEnvs(), obsDim=envs[0].OBS_DIM;
+  // streams
+  const SO=[],SA=[],SL=[],SR=[],SV=[],SD=[]; for(let b=0;b<B;b++){SO.push([]);SA.push([]);SL.push([]);SR.push([]);SV.push([]);SD.push([]);}
+  let cur=envs.map(e=>e.reset());
+  const rets=new Array(B).fill(0), epRets=[], ends={};
+  const stdNow=Math.exp(agent.logStd.arraySync()[0]);
+  for(let t=0;t<T;t++){
+    const {mean,value}=agent.forwardBatch(cur);
+    const acts=[];
+    for(let b=0;b<B;b++){ const a=new Float32Array(agent.actDim); let lp=0;
+      for(let i=0;i<agent.actDim;i++){ const mu=mean[b][i], ai=mu+stdNow*gauss(envs[b].rng); a[i]=ai;
+        const d=(ai-mu)/stdNow; lp+=-0.5*d*d-Math.log(stdNow)-0.5*LOG2PI; }
+      acts.push(a);
+      SO[b].push(cur[b]); SA[b].push(a); SL[b].push(lp); SV[b].push(value[b]); }
+    for(let b=0;b<B;b++){ const r=envs[b].step(acts[b]); SR[b].push(r.reward); SD[b].push(r.done?1:0); rets[b]+=r.reward;
+      if(r.done){ epRets.push(rets[b]); rets[b]=0; ends[r.end]=(ends[r.end]||0)+1; cur[b]=envs[b].reset(); } else cur[b]=r.obs; }
+    displayEnv=envs[0];
+  }
+  // bootstrap + GAE per stream, flatten
+  const last=agent.forwardBatch(cur).value;
+  const O=[],A=[],LP=[],ADV=[],RET=[];
+  for(let b=0;b<B;b++){ const {adv,ret}=agent.gae(SR[b],SV[b],SD[b],last[b]);
+    for(let t=0;t<T;t++){ O.push(SO[b][t]); A.push(SA[b][t]); LP.push(SL[b][t]); ADV.push(adv[t]); RET.push(ret[t]); } }
+  const info=await agent.update(O,A,LP,ADV,RET);
+  const nEp=epRets.length||1, meanRet=epRets.reduce((a,b)=>a+b,0)/nEp;
+  const goalP=(ends.goal||0)/nEp*100, crashP=((ends.crash||0)+(ends.jackknife||0)+(ends.offlane||0))/nEp*100;
+  return {meanRet, goalP, crashP, nEp, std:info.std??stdNow, kl:info.kl};
+}
+
+async function loop(){
+  while(running){
+    const frac=Math.min(1,iter/200);
+    agent.setLR(3e-4*(1-0.7*frac)); agent.entCoef=agent.entCoef0*Math.max(0,1-1.3*frac);
+    const m=await rolloutAndUpdate();
+    hist.push(m); iter++;
+    renderStats(m); drawChart();
+    await tf.nextFrame();
+  }
+}
+
+/* ====================== RENDERING ARCHITECTURE ======================
+   Sim is decoupled from drawing: env.getView() returns a plain scene description,
+   and a pluggable Renderer consumes it. A camera sits between them. A requestAnimationFrame
+   loop renders the current displayEnv every frame (smooth), independent of training cadence.
+   Renderers: Renderer2D (chase / top-down) now; Renderer3D (in-cab, Three.js) scaffolded. */
+let displayEnv=null, _lastEnv=null, activeRenderer=null, viewMode='chase';
+const view=$('view'), vg=view.getContext('2d');
+function rr(g,x,y,w,h,r){ r=Math.min(r,Math.abs(w)/2,Math.abs(h)/2); g.beginPath(); g.moveTo(x+r,y); g.arcTo(x+w,y,x+w,y+h,r); g.arcTo(x+w,y+h,x,y+h,r); g.arcTo(x,y+h,x,y,r); g.arcTo(x,y,x+w,y,r); g.closePath(); }
+function fit2d(){ const dpr=Math.min(2,window.devicePixelRatio||1), w=view.clientWidth||600, h=view.clientHeight||400;
+  if(view.width!==w*dpr||view.height!==h*dpr){ view.width=w*dpr; view.height=h*dpr; } vg.setTransform(dpr,0,0,dpr,0,0); view._w=w; view._h=h; }
+function banner(msg,sub){ fit2d(); $('view').style.display='block'; $('view3d').style.display='none'; vg.clearRect(0,0,view._w,view._h);
+  vg.fillStyle='#e8584f'; vg.font='14px ui-monospace,monospace'; vg.fillText(msg,20,30);
+  if(sub){ vg.fillStyle='#7d8b9c'; vg.font='12px ui-monospace,monospace'; sub.split('\n').forEach((l,i)=>vg.fillText(l,20,56+i*18)); } }
+
+/* ---- smooth follow camera (world->screen for the 2D chase view) ---- */
+const cam={ x:0, y:0, init:false };
+function camFollow(cx,cy,k=0.12){ if(!cam.init){cam.x=cx;cam.y=cy;cam.init=true;} cam.x+=(cx-cam.x)*k; cam.y+=(cy-cam.y)*k; }
+
+/* ============================ 2D RENDERER ============================ */
+const Renderer2D = {
+  enter(){ $('view').style.display='block'; $('view3d').style.display='none'; },
+  exit(){},
+  render(s){
+    fit2d(); const W=view._w, H=view._h, g=vg;
+    if(s.kind==='toy'){ g.fillStyle='#0a0d11'; g.fillRect(0,0,W,H); const S=Math.min(W,H)/2.4, X=x=>W/2+x*S, Y=y=>H/2+y*S;
+      g.strokeStyle='#52d273'; g.lineWidth=2; g.beginPath(); g.arc(X(s.gx),Y(s.gy),9,0,7); g.stroke();
+      g.fillStyle='#ffd23f'; g.beginPath(); g.arc(X(s.px),Y(s.py),6,0,7); g.fill(); return; }
+
+    const hw=s.road.halfWidth;
+    let S, camX, camY;
+    if(viewMode==='topdown'){ S=Math.min(W/(s.road.length+120), H/(2*hw+160)); camX=s.road.length/2; camY=0; cam.init=false; }
+    else { const z=Math.min(1,s.v/2.2); S=Math.min(2.1, W/720)*(1-0.12*z); camFollow(s.tractor.x+90+40*z, s.tractor.y*0.6); camX=cam.x; camY=cam.y; }
+    const ox=viewMode==='topdown'?(W-(s.road.length)*S)/2 - 60*S +60: W*0.32, oy=H/2;
+    const X=x=>ox+(x-camX)*S, Y=y=>oy+(y-camY)*S;
+
+    // grass / ground
+    g.fillStyle='#0e1512'; g.fillRect(0,0,W,H);
+    // road band
+    const ry0=Y(-hw), ry1=Y(hw); const grad=g.createLinearGradient(0,ry0,0,ry1);
+    grad.addColorStop(0,'#20262f'); grad.addColorStop(0.5,'#191f27'); grad.addColorStop(1,'#20262f');
+    g.fillStyle=grad; g.fillRect(X(-40),ry0,(s.road.length+80)*S,ry1-ry0);
+    // shoulders + rumble strip
+    g.strokeStyle='#8693a3'; g.lineWidth=Math.max(1.5,2*S);
+    g.beginPath(); g.moveTo(X(0),ry0); g.lineTo(X(s.road.length),ry0); g.moveTo(X(0),ry1); g.lineTo(X(s.road.length),ry1); g.stroke();
+    g.fillStyle='#cf4b43'; const rs=40; for(let x=0;x<s.road.length;x+=rs){ const xa=X(x); g.fillRect(xa,ry0-3*S,Math.max(1,rs*0.5*S),3*S); g.fillRect(xa,ry1,Math.max(1,rs*0.5*S),3*S); }
+    // dashed centerline
+    g.strokeStyle='#c9b24a'; g.lineWidth=Math.max(1,2.5*S); g.setLineDash([18*S,16*S]); g.lineDashOffset=-( (cam.x||0)*S%((34)*S));
+    g.beginPath(); g.moveTo(X(0),Y(0)); g.lineTo(X(s.road.length),Y(0)); g.stroke(); g.setLineDash([]);
+    // goal: checkered + glow
+    const gx=X(s.road.goalX); const gsq=Math.max(5,(ry1-ry0)/10);
+    const glow=g.createLinearGradient(gx-40,0,gx+10,0); glow.addColorStop(0,'#52d27300'); glow.addColorStop(1,'#52d27333');
+    g.fillStyle=glow; g.fillRect(gx-40,ry0,50,ry1-ry0);
+    for(let r=0;ry0+r*gsq<ry1;r++)for(let c=0;c<2;c++){ g.fillStyle=((r+c)&1)?'#e8edf3':'#222a35'; g.fillRect(gx+c*gsq,ry0+r*gsq,gsq,gsq); }
+
+    // trail
+    if(s.trail&&s.trail.length>3){ g.lineWidth=Math.max(1.5,2*S); g.strokeStyle='#ffd23f55'; g.beginPath();
+      g.moveTo(X(s.trail[0]),Y(s.trail[1])); for(let i=2;i<s.trail.length;i+=2)g.lineTo(X(s.trail[i]),Y(s.trail[i+1])); g.stroke(); }
+
+    // obstacles as cars (with shadow)
+    for(const o of s.obstacles){ const cxp=X(o.x), cyp=Y(o.y), w=22*S, h=13*S;
+      g.fillStyle='#0006'; g.beginPath(); g.ellipse(cxp,cyp+h*0.5,w*0.55,h*0.4,0,0,7); g.fill();
+      g.save(); g.translate(cxp,cyp);
+      g.fillStyle='#d9483f'; rr(g,-w/2,-h/2,w,h,4*S); g.fill();
+      g.fillStyle='#7a2620'; rr(g,-w*0.18,-h*0.36,w*0.36,h*0.72,2*S); g.fill();        // roof
+      g.fillStyle='#bfe0ff'; g.fillRect(-w*0.42,-h*0.28,w*0.14,h*0.56);                  // windshield
+      if(Math.abs(o.vy)>1e-3){ g.strokeStyle='#ffd0cc'; g.lineWidth=1.5; g.beginPath(); g.moveTo(0,0); g.lineTo(0,Math.sign(o.vy)*15*S); g.stroke(); }
+      g.restore(); }
+
+    // rig
+    const box=(c,len,wid,ang,fill,stroke,ridges)=>{ g.save(); g.translate(X(c.x),Y(c.y)); g.rotate(ang);
+      g.fillStyle='#0007'; rr(g,-len*S/2,-wid*S/2+3*S,len*S,wid*S,4*S); g.fill();                 // shadow
+      g.fillStyle=fill; rr(g,-len*S/2,-wid*S/2,len*S,wid*S,4*S); g.fill();
+      if(stroke){ g.strokeStyle=stroke; g.lineWidth=1.5; g.stroke(); }
+      if(ridges){ g.strokeStyle='#ffffff14'; g.lineWidth=1; for(let i=1;i<6;i++){ const xx=-len*S/2+i*len*S/6; g.beginPath(); g.moveTo(xx,-wid*S/2+2); g.lineTo(xx,wid*S/2-2); g.stroke(); } }
+      g.fillStyle='#0c0f14'; const ww=7*S,wl=5*S;
+      g.fillRect(-len*S/2+wl,-wid*S/2-2*S,ww,2.5*S); g.fillRect(len*S/2-wl-ww,-wid*S/2-2*S,ww,2.5*S);
+      g.fillRect(-len*S/2+wl,wid*S/2-0.5*S,ww,2.5*S); g.fillRect(len*S/2-wl-ww,wid*S/2-0.5*S,ww,2.5*S);
+      g.restore(); };
+    // hitch
+    g.strokeStyle='#2a3340'; g.lineWidth=3*S; g.beginPath(); g.moveTo(X(s.trailer.x),Y(s.trailer.y)); g.lineTo(X(s.tractor.x),Y(s.tractor.y)); g.stroke();
+    box(s.trailer,s.trailer.len,s.trailer.wid,s.trailer.h,'#3f6cb0','#6ca8ff',true);
+    box(s.tractor,s.tractor.len,s.tractor.wid,s.tractor.h,'#ffd23f','#fff0b0',false);
+    // windshield + headlight cone on cab
+    g.save(); g.translate(X(s.tractor.x),Y(s.tractor.y)); g.rotate(s.tractor.h);
+    g.fillStyle='#bfe0ff'; g.fillRect(s.tractor.len*S/2-6*S,-s.tractor.wid*S/2+3*S,4*S,s.tractor.wid*S-6*S);
+    const cone=g.createLinearGradient(s.tractor.len*S/2,0,s.tractor.len*S/2+50*S,0); cone.addColorStop(0,'#fff7d655'); cone.addColorStop(1,'#fff7d600');
+    g.fillStyle=cone; g.beginPath(); g.moveTo(s.tractor.len*S/2,-s.tractor.wid*S/2); g.lineTo(s.tractor.len*S/2+50*S,-s.tractor.wid*S); g.lineTo(s.tractor.len*S/2+50*S,s.tractor.wid*S); g.lineTo(s.tractor.len*S/2,s.tractor.wid*S/2); g.closePath(); g.fill();
+    // turn signals
+    if(Math.abs(s.steer)>0.12){ g.fillStyle='#ffae3a'; const sy=Math.sign(s.steer)*s.tractor.wid*S/2; g.beginPath(); g.arc(s.tractor.len*S/2-3*S,sy,2.5*S,0,7); g.fill(); }
+    // steered front wheels
+    g.fillStyle='#0c0f14'; for(const sy of [-1,1]){ g.save(); g.translate(s.tractor.len*S/2-4*S, sy*s.tractor.wid*S/2); g.rotate(s.steer); g.fillRect(-4*S,-1.5*S,8*S,3*S); g.restore(); }
+    g.restore();
+
+    // predicted-path "intent" line: forward-integrate kinematics under current steer/throttle
+    if(viewMode!=='topdown'){ let px=s.tractor.x, py=s.tractor.y, ph=s.tractor.h, pv=s.v;
+      g.strokeStyle='#3fe0ffaa'; g.lineWidth=Math.max(1.5,2*S); g.setLineDash([6*S,5*S]); g.beginPath(); g.moveTo(X(px),Y(py));
+      for(let i=0;i<28;i++){ pv=Math.max(-0.4,Math.min(2.2,pv+s.throttle*0.08)); ph+=(pv/38)*Math.tan(s.steer); px+=pv*Math.cos(ph); py+=pv*Math.sin(ph); g.lineTo(X(px),Y(py)); }
+      g.stroke(); g.setLineDash([]); }
+    // dust kicked up behind the trailer at speed
+    if(!this._dust)this._dust=[]; const D=this._dust;
+    if(s.v>0.9 && D.length<70){ const bx=s.trailer.x-s.trailer.len/2*Math.cos(s.trailer.h), by=s.trailer.y-s.trailer.len/2*Math.sin(s.trailer.h);
+      for(const sgn of [-1,1]) D.push({x:bx,y:by+sgn*8,vx:-s.v*0.2*Math.cos(s.trailer.h)+(Math.random()-0.5),vy:(Math.random()-0.5)*0.6,a:0.5}); }
+    for(let i=D.length-1;i>=0;i--){ const p=D[i]; p.x+=p.vx; p.y+=p.vy; p.a-=0.018; if(p.a<=0){D.splice(i,1);continue;}
+      g.fillStyle='rgba(150,150,150,'+p.a.toFixed(2)+')'; g.beginPath(); g.arc(X(p.x),Y(p.y),Math.max(1,2.4*S),0,7); g.fill(); }
+
+    drawHUD(g,W,H,s);
+    if(viewMode!=='topdown') drawMinimap(g,W,H,s);
+    // vignette
+    const vg2=g.createRadialGradient(W/2,H/2,Math.min(W,H)*0.35,W/2,H/2,Math.max(W,H)*0.62);
+    vg2.addColorStop(0,'#0000'); vg2.addColorStop(1,'#0008'); g.fillStyle=vg2; g.fillRect(0,0,W,H);
+  }
+};
+function drawHUD(g,W,H,s){
+  // distance progress bar (top)
+  const pad=16, bw=W-2*pad, prog=1-Math.min(1,s.distToGoal/s.road.goalX);
+  g.fillStyle='#1b2230'; rr(g,pad,12,bw,6,3); g.fill();
+  g.fillStyle='#52d273'; rr(g,pad,12,bw*prog,6,3); g.fill();
+  g.fillStyle='#7d8b9c'; g.font='11px ui-monospace,monospace'; g.textAlign='left';
+  g.fillText('to goal '+s.distToGoal.toFixed(0)+'px',pad,36);
+  // speedometer (bottom-left arc)
+  const cx=46, cy=H-46, R=28, vmax=2.2, frac=Math.max(0,Math.min(1,s.v/vmax));
+  g.strokeStyle='#1b2230'; g.lineWidth=6; g.beginPath(); g.arc(cx,cy,R,Math.PI*0.75,Math.PI*2.25); g.stroke();
+  g.strokeStyle='#ffd23f'; g.beginPath(); g.arc(cx,cy,R,Math.PI*0.75,Math.PI*0.75+frac*Math.PI*1.5); g.stroke();
+  g.fillStyle='#cdd6e0'; g.font='bold 13px ui-monospace,monospace'; g.textAlign='center'; g.fillText(s.v.toFixed(1),cx,cy+4);
+  g.fillStyle='#7d8b9c'; g.font='8px ui-monospace,monospace'; g.fillText('SPEED',cx,cy+15); g.textAlign='left';
+}
+function drawMinimap(g,W,H,s){
+  const mw=Math.min(260,W*0.5), mh=26, mx=(W-mw)/2, my=H-mh-10, S=mw/s.road.length;
+  g.fillStyle='#0c1016cc'; rr(g,mx,my,mw,mh,5); g.fill();
+  g.strokeStyle='#2a3340'; g.lineWidth=1; g.strokeRect(mx,my,mw,mh);
+  g.fillStyle='#52d273'; g.fillRect(mx+s.road.goalX*S-2,my+3,2,mh-6);
+  g.fillStyle='#d9483f'; for(const o of s.obstacles){ g.fillRect(mx+o.x*S-1,my+mh/2-2,2,4); }
+  g.fillStyle='#ffd23f'; g.beginPath(); g.arc(mx+s.tractor.x*S,my+mh/2,3,0,7); g.fill();
+}
+
+/* ============================ 3D RENDERER (in-cab, experimental) ============================ */
+const THREE_URL='https://cdn.jsdelivr.net/npm/three@0.128.0/build/three.min.js';
+let _threeLoading=null;
+function loadThree(){ if(window.THREE)return Promise.resolve(); if(_threeLoading)return _threeLoading;
+  _threeLoading=new Promise((res,rej)=>{ const sc=document.createElement('script'); sc.src=THREE_URL; sc.onload=res; sc.onerror=()=>rej(new Error('three.js CDN load failed')); document.head.appendChild(sc); });
+  return _threeLoading; }
+const Renderer3D = {
+  ready:false, scene:null, cam:null, rend:null, truck:null, obs:[], _raf:null,
+  async enter(){
+    $('view').style.display='none'; $('view3d').style.display='block'; $('hud3d').style.display='block';
+    try{ await loadThree(); this.init(); this.ready=true; }
+    catch(e){ this.ready=false; viewMode='chase'; $('viewmode').value='chase'; activeRenderer=Renderer2D; $('hud3d').style.display='none'; Renderer2D.enter(); banner('3D unavailable: '+e.message,'Falling back to 2D. (Needs WebGL + three.js from CDN.)'); }
+  },
+  exit(){ $('view3d').style.display='none'; $('hud3d').style.display='none'; },
+  init(){
+    const T=window.THREE, host=$('view3d'); host.innerHTML='';
+    const w=host.clientWidth||600, h=host.clientHeight||400;
+    this.scene=new T.Scene(); this.scene.background=new T.Color(0x0b1016); this.scene.fog=new T.Fog(0x0b1016,200,1400);
+    this.cam=new T.PerspectiveCamera(70,w/h,0.5,3000);
+    this.rend=new T.WebGLRenderer({antialias:true}); this.rend.setSize(w,h); this.rend.setPixelRatio(Math.min(2,window.devicePixelRatio||1)); host.appendChild(this.rend.domElement);
+    this.scene.add(new T.HemisphereLight(0xbcd6ff,0x202820,0.9));
+    const sun=new T.DirectionalLight(0xffffff,0.7); sun.position.set(-1,2,1); this.scene.add(sun);
+    // road
+    const road=new T.Mesh(new T.PlaneGeometry(4000,140), new T.MeshStandardMaterial({color:0x20262f}));
+    road.rotation.x=-Math.PI/2; road.position.set(1500,0,0); this.scene.add(road);
+    // lane edges + center
+    const line=(z,c)=>{ const m=new T.Mesh(new T.BoxGeometry(4000,0.4,2), new T.MeshStandardMaterial({color:c})); m.position.set(1500,0.1,z); this.scene.add(m); };
+    line(-70,0x8693a3); line(70,0x8693a3);
+    for(let x=0;x<3000;x+=34){ const d=new T.Mesh(new T.BoxGeometry(18,0.4,2.5),new T.MeshStandardMaterial({color:0xc9b24a})); d.position.set(x,0.1,0); this.scene.add(d); }
+    // goal wall
+    const goal=new T.Mesh(new T.BoxGeometry(4,30,140),new T.MeshStandardMaterial({color:0x52d273,emissive:0x123a1f})); goal.position.set(1100,15,0); this.scene.add(goal); this.goal=goal;
+    // truck group: trailer + cab + wheels
+    this.truck=new T.Group();
+    const trailer=new T.Mesh(new T.BoxGeometry(92,30,26),new T.MeshStandardMaterial({color:0x3f6cb0})); trailer.position.set(-46,17,0);
+    const cab=new T.Mesh(new T.BoxGeometry(34,26,24),new T.MeshStandardMaterial({color:0xffd23f})); cab.position.set(17,15,0);
+    this.truck.add(trailer); this.truck.add(cab);
+    const wheelGeo=new T.CylinderGeometry(7,7,4,12), wheelMat=new T.MeshStandardMaterial({color:0x0c0f14});
+    [[-80,13],[-12,13],[10,13]].forEach(([x,z])=>{ for(const sz of [-1,1]){ const wmesh=new T.Mesh(wheelGeo,wheelMat); wmesh.rotation.x=Math.PI/2; wmesh.position.set(x,7,sz*z); this.truck.add(wmesh); } });
+    this.scene.add(this.truck);
+    this.obs=[]; this._obsGeo=new T.BoxGeometry(22,16,13); this._obsMat=new T.MeshStandardMaterial({color:0xd9483f});
+    window.addEventListener('resize',()=>this._resize());
+  },
+  _resize(){ if(!this.ready)return; const host=$('view3d'),w=host.clientWidth,h=host.clientHeight; this.cam.aspect=w/h; this.cam.updateProjectionMatrix(); this.rend.setSize(w,h); },
+  render(s){
+    if(!this.ready||s.kind!=='truck')return; const T=window.THREE;
+    // world(x along road, y lateral) -> three (X=x, Z=y, Y up)
+    this.truck.position.set(s.tractor.x,0,s.tractor.y); this.truck.rotation.y=-s.tractor.h;
+    // obstacle pool
+    while(this.obs.length<s.obstacles.length){ const m=new T.Mesh(this._obsGeo,this._obsMat); this.scene.add(m); this.obs.push(m); }
+    for(let i=0;i<this.obs.length;i++){ if(i<s.obstacles.length){ const o=s.obstacles[i]; this.obs[i].visible=true; this.obs[i].position.set(o.x,8,o.y); } else this.obs[i].visible=false; }
+    // camera
+    const ch=s.tractor.h, fx=Math.cos(ch), fz=Math.sin(ch);
+    if(viewMode==='cab3d'){
+      // in the cab: just behind/above the windshield, looking down the road
+      this.cam.position.set(s.tractor.x-fx*6, 22, s.tractor.y-fz*6);
+      this.cam.lookAt(s.tractor.x+fx*80, 12, s.tractor.y+fz*80);
+    } else {
+      // 3D chase: behind and above the rig, looking forward over it
+      this.cam.position.set(s.trailer.x-fx*120, 70, s.trailer.y-fz*120);
+      this.cam.lookAt(s.tractor.x+fx*40, 8, s.tractor.y+fz*40);
+    }
+    this.rend.render(this.scene,this.cam);
+    draw3DHud(s);
+  }
+};
+function draw3DHud(s){ const c=$('hud3d'), dpr=Math.min(2,window.devicePixelRatio||1), w=c.clientWidth||600, h=c.clientHeight||400;
+  if(c.width!==w*dpr||c.height!==h*dpr){ c.width=w*dpr; c.height=h*dpr; } const g=c.getContext('2d'); g.setTransform(dpr,0,0,dpr,0,0); g.clearRect(0,0,w,h);
+  if(viewMode==='cab3d'){ // dashboard + A-pillars to sell the in-cab feel
+    g.fillStyle='#0d1117ee'; g.beginPath(); g.moveTo(0,h); g.lineTo(0,h-70); g.quadraticCurveTo(w*0.5,h-110,w,h-70); g.lineTo(w,h); g.closePath(); g.fill();
+    g.fillStyle='#0d1117'; g.beginPath(); g.moveTo(0,0); g.lineTo(70,0); g.lineTo(20,h); g.lineTo(0,h); g.closePath(); g.fill();
+    g.beginPath(); g.moveTo(w,0); g.lineTo(w-70,0); g.lineTo(w-20,h); g.lineTo(w,h); g.closePath(); g.fill();
+    // steering wheel
+    g.save(); g.translate(w*0.5,h-12); g.rotate(s.steer*2.2); g.strokeStyle='#1b2230'; g.lineWidth=7; g.beginPath(); g.arc(0,0,30,0,7); g.stroke();
+    g.strokeStyle='#2a3340'; g.lineWidth=4; g.beginPath(); g.moveTo(-30,0); g.lineTo(30,0); g.moveTo(0,0); g.lineTo(0,30); g.stroke(); g.restore(); }
+  // speed + distance readout (both 3D modes)
+  g.fillStyle='#cdd6e0'; g.font='bold 15px ui-monospace,monospace'; g.textAlign='left'; g.fillText(s.v.toFixed(1)+' u/s',16,26);
+  g.fillStyle='#7d8b9c'; g.font='11px ui-monospace,monospace'; g.fillText('to goal '+s.distToGoal.toFixed(0),16,44);
+  const bw=w-32, prog=1-Math.min(1,s.distToGoal/s.road.goalX); g.fillStyle='#1b2230'; rr(g,16,52,bw,5,2); g.fill(); g.fillStyle='#52d273'; rr(g,16,52,bw*prog,5,2); g.fill();
+}
+
+/* ---- frame loop: render current displayEnv every animation frame ---- */
+function renderFrame(){ try{ const env=displayEnv||_lastEnv; if(env&&activeRenderer){ activeRenderer.render(env.getView()); } }catch(e){ /* keep loop alive */ } requestAnimationFrame(renderFrame); }
+function setView(mode){ if(activeRenderer&&activeRenderer.exit)activeRenderer.exit(); viewMode=mode;
+  if(mode==='cab3d'||mode==='chase3d'){ activeRenderer=Renderer3D; Renderer3D.enter(); } else { activeRenderer=Renderer2D; Renderer2D.enter(); } }
+
+function renderStats(m){
+  $('stats').innerHTML=[
+    ['iteration',iter],['mean return',m.meanRet.toFixed(2)],
+    ['goal %',m.goalP.toFixed(0)+'%'],['crash %',m.crashP.toFixed(0)+'%'],
+    ['episodes/iter',m.nEp],['policy std',(m.std||0).toFixed(3)],
+    ['approx KL',(m.kl||0).toFixed(4)],['samples/update',B*T]
+  ].map(([k,v])=>`<div class="stat"><span class="k">${k}</span><b>${v}</b></div>`).join('');
+}
+const chart=$('chart'), cg=chart.getContext('2d');
+function drawChart(){ chart.width=chart.clientWidth; chart.height=90; cg.clearRect(0,0,chart.width,chart.height);
+  if(hist.length<2)return; const rs=hist.map(h=>h.meanRet); let mn=Math.min(...rs),mx=Math.max(...rs); if(mx-mn<1e-6)mx=mn+1;
+  cg.strokeStyle='#ffd23f'; cg.lineWidth=1.5; cg.beginPath();
+  hist.forEach((h,i)=>{ const x=i/(hist.length-1)*(chart.width-4)+2, y=84-((h.meanRet-mn)/(mx-mn))*78; i?cg.lineTo(x,y):cg.moveTo(x,y); }); cg.stroke();
+  cg.strokeStyle='#52d273'; cg.beginPath();
+  hist.forEach((h,i)=>{ const x=i/(hist.length-1)*(chart.width-4)+2, y=84-(h.goalP/100)*78; i?cg.lineTo(x,y):cg.moveTo(x,y); }); cg.stroke();
+  cg.fillStyle='#ffd23f'; cg.font='9px monospace'; cg.fillText('return',4,10); cg.fillStyle='#52d273'; cg.fillText('goal%',52,10);
+}
+
+/* ---------- backend init + controls ---------- */
+async function initBackend(){
+  const order=['webgpu','webgl','cpu'];
+  for(const b of order){ try{ await tf.setBackend(b); await tf.ready(); if(tf.getBackend()===b) break; }catch(e){} }
+  const be=tf.getBackend();
+  $('backend').textContent='backend: '+be; $('backend').className='pill '+(be==='webgpu'?'good':(be==='cpu'?'bad':''));
+}
+function newAgent(){ if(agent)agent.dispose(); const e=$('task').value==='toy'?new ToyEnv(mkrng(1)):new TruckEnv(mkrng(1),{nObs:+$('nobs').value});
+  e.reset(); _lastEnv=e; displayEnv=e; cam.init=false; agent=new PPO(e.OBS_DIM,e.ACT_DIM,{}); hist=[]; iter=0; $('stats').innerHTML=''; drawChart(); }
+$('nobs').addEventListener('input',()=>$('nobsv').textContent=$('nobs').value);
+$('task').addEventListener('change',()=>{ const toy=$('task').value==='toy'; $('obsRow').style.display=toy?'none':'flex';
+  if(toy&&(viewMode==='cab3d'||viewMode==='chase3d')){ $('viewmode').value='chase'; setView('chase'); } newAgent(); });
+$('viewmode').addEventListener('change',()=>setView($('viewmode').value));
+$('reset').addEventListener('click',newAgent);
+$('start').addEventListener('click',async()=>{ if(running)return; running=true; $('start').disabled=true; $('stop').disabled=false; $('status').textContent='training'; $('status').className='pill good'; if(!agent)newAgent(); loop(); });
+$('stop').addEventListener('click',()=>{ running=false; $('start').disabled=false; $('stop').disabled=true; $('status').textContent='paused'; $('status').className='pill'; });
+window.addEventListener('resize',()=>{ drawChart(); });
+
+(async()=>{
+  if(typeof tf==='undefined'){ $('backend').textContent='backend: tfjs FAILED to load'; $('backend').className='pill bad'; $('status').textContent='offline';
+    banner('TensorFlow.js did not load.', 'This file pulls tfjs from a CDN, so it needs internet on first open.\nCheck your connection / try Chrome or Edge, then reload.\n(The node scripts in this folder run fully offline.)'); return; }
+  try{ await initBackend(); newAgent(); activeRenderer=Renderer2D; Renderer2D.enter(); requestAnimationFrame(renderFrame); $('status').textContent='ready'; }
+  catch(e){ $('status').textContent='error'; $('status').className='pill bad'; banner('init error: '+e.message,'Open the browser console (F12) and send me the red error text.'); }
+})();
+</script>
+</body>
+</html>
