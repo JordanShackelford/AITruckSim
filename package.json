@@ -10,7 +10,9 @@
     "train": "node trucktrain.js",
     "train:drive": "NOBS=0 node trucktrain.js",
     "train:dodge": "NOBS=2 node trucktrain.js",
-    "ab": "node trucktrain_attn.js"
+    "ab": "node trucktrain_attn.js",
+    "expert": "node expert.js",
+    "imitate": "node imitate.js"
   },
   "keywords": ["reinforcement-learning", "ppo", "self-driving", "attention", "webgpu"]
 }
